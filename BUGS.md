@@ -319,6 +319,237 @@
 
 ---
 
+## P3-07：Schema `"name"` 字段超 25 字符 push 失败
+
+- **症状**：`shopify theme push` 报 `Invalid schema: name is too long (max 25 characters)`，同时 `templates/index.json` 报 `Section type '...' does not refer to an existing section file`——因为 schema 验证失败，那个 .liquid 文件就不存在了
+- **根因**：Shopify 对 section schema 的 `name` 字段有 25 字符的硬上限（实测 2026-05）。`"FL Collections Overview"` 是 23 字符还行，`"Floema · Collections Overview"` 30 字符直接拒
+- **修法**：`build-*-sections.mjs` 里组合 schema 时 truncate：`if (name.length > 25) name = name.slice(0, 25)`。命名风格用短缩写前缀（`FL`/`MN`/`FFD`）+ 大写词组
+- **教训**：
+  1. 25 字符上限对**带项目前缀 + 长 section 名**很容易撞。floema 项目 14 个 section 撞了 5 个
+  2. schema 的 `presets[].name` 同样受 25 字符限制
+  3. 当看到 templates/index.json 报"section type does not refer to an existing section file"，**先看上面有没有 schema validation error**——通常是 section 编译失败导致它"不存在"
+
+## P3-07b：**Section 文件名（= section type）也有 25 字符硬上限，但 push 时静默拒绝**
+
+- **症状**：修完 P3-07 的 schema name 长度后再 push 显示 `upload complete` 无错误，看起来成功；但访问 storefront preview，首页显示 404 模板内容（不是 index）。再单独 push templates/index.json 时才报 `Section type 'floema-07-workflow-overview' does not refer to an existing section file`
+- **根因**：除了 schema `name` 字段，**section 文件名（去 `.liquid` 后缀 = section type）也有 25 字符上限**。`floema-07-workflow-overview` 是 27 字符，**Shopify 服务端静默拒绝，但 CLI 的 push 不报错**。后续 templates/index.json 上传时引用这个 type 才暴露——而 index.json validation 一旦失败，整个首页 fallback 到 404 模板渲染
+- **修法**：
+  - 把 `build-*-sections.mjs` 加上 section type 长度检查，自动用缩写表替换（`-collections` → `-coll`、`-highlight` → `-hl`、`-overview` → `-ovr`、`-products` → `-prods` 等）截到 ≤25
+  - 让 build 脚本顺带写 `templates/index.json`——文件名和 index.json 引用的 type 永远同步，不会因为后续手动 rename 一边而忘了另一边
+- **教训**：
+  1. **`upload complete` 不等于全部文件落地**。Shopify CLI 对 section 文件名超长是 silent reject。判定标准用 `--json` 输出里的 `"errors"` 字段，不是看人类可读的 "complete" 文字
+  2. **诊断 "preview 走 404 模板" 的标准做法**：单独 push `templates/index.json` 看 JSON 输出，它会列出所有 `Section type 'X' does not refer to an existing section file` 错误——这是 section 文件名超长的 smoking gun
+  3. **section type 限制不只是文件名**，还反映到 `.liquid` 中通过 `data-section-id`/`section.id`/`section.type` 流转的所有地方。一律压在 25 字符以下
+  4. **build 脚本应该同时输出 sections + index.json**——避免 type 名重命名后人工维护 index.json 漏掉某个
+
+## P3-07c：Shopify CLI bulk push 会静默跳过部分新文件，单独推才上传
+
+- **症状**：本地有 14 个新名字的 sections，跑 `shopify theme push --only "sections/floema-*.liquid"` 显示 `Theme upload complete` 无 errors，但服务端 pull 下来一看只有 9 个，缺 5 个新文件
+- **根因**：Shopify CLI（3.94.3 实测）在 bulk push 时基于 checksum 做 diff 决定是否上传，**对某些新文件存在错误判定，认为不需要上传**而跳过——CLI verbose log 里看不到该文件被处理。把同一个文件**单独**用 `--only "sections/foo.liquid"` push，CLI 反而正确上传
+- **修法**：
+  - 对关键 sections 用 `shopify theme pull --only "sections/<name>.liquid"` 验证服务端真的有
+  - 如果服务端缺失，**逐个单独 push** —— `for f in foo bar baz; do shopify theme push --only "sections/$f.liquid"; done`
+  - 或者改大动作：删掉这 5 个本地文件 → push 一次（让 CLI 删 remote 旧版本，但因为 local 没了所以 CLI 不会判断 checksum 相同）→ 重建本地文件 → 再 push 一次
+- **教训**：
+  1. **`upload complete` + 0 errors ≠ 文件落地**。哪怕 JSON 输出干净，仍要 pull 验证关键文件是否在服务端
+  2. CLI bulk push 的 checksum diff 算法对"local 新文件 + server 没有"这种 case **有时会跳过**——可能跟之前 push 残留的某种缓存有关。绕过：**对关键文件单独 push 一遍**作为兜底
+  3. 这次 floema-v1 在这条上卡了一整轮迭代（push 报成功 → 服务端缺 5 个 → index.json 引用失败 → 整页渲染 404 fallback）。诊断时间 ≈ 30 分钟
+
+## P3-07d：Shopify CLI 状态污染后单文件 push 全部失效，admin 时间戳是唯一真相
+
+- **症状**：删过一批 layout/template 别名后，CLI 报过一次 `"layout/theme.liquid could not be deleted"` 警告；之后**所有 `--only` 单文件 push 不管推什么都报 `Theme upload complete`**，但 admin Themes 列表里 `Last saved` 时间戳**永远停留在最早创建时间**。表现像主题被冻结
+- **根因**：Shopify CLI 3.94.3 在某种内部 state（一次 mirror push 删除失败后）会卡在某种 cache 污染态，单文件推送被完全跳过——既不上传、也不报错。"upload complete" 只是 CLI 客户端写出的常量字符串
+- **修法**：
+  - **判断 push 是否真生效，看 admin Themes 列表的 `Last saved` 时间戳**——这是唯一可靠的服务端真相，比 CLI 输出可信度高得多
+  - **CLI 卡死后，唯一突破方式是不带 `--only` 的完整 mirror push**：`shopify theme push --theme=ID --nodelete -s store`
+  - 关键观察指标：成功的全量 push 会在 stdout 显示 `Uploading files to remote theme [XX%]` 进度条；如果只看到 `Cleaning your remote theme [100%]` + `Theme upload complete` 而没有 upload 进度条，说明又被 silent-skip 了，要再跑一次
+  - 加 `--nodelete` 避免之前那次 `could not be deleted` 状态再次触发
+- **教训**：
+  1. **永远别相信 `Theme upload complete`**——它是 CLI 客户端常量字符串，跟服务端无关。判定标准只看 admin 时间戳 + view-source 实际 HTML
+  2. **诊断 banner 是验证 push 是否真生效最快的方法**：往 theme.liquid 的 head 里 inline 写一段 `<style> body::before { content: "v1234" ... } </style>`，每次改 v 编号，刷 preview 看 banner 编号 — 不出现就是 silent skip
+  3. floema-v1 在这条上卡了 3+ 小时，30+ 次单文件 push 全部无效。教训：**部署阶段如果 user 反复说"没看到变化"，第一件事是去 admin 列表看时间戳**，而不是怀疑 CSS / cascade / 浏览器缓存
+
+## P3-07e：CLI checksum cache 死锁 — 修改文件内容后 silent-skip 不上传
+
+- **症状**：改了 `assets/foo.css` 添加了 `!important`，跑 `shopify theme push --only "assets/foo.css"` 显示 `Theme upload complete` 但没有 `Uploading [XX%]` 进度条；连改 v 编号注释、连推 5 次都不行。**服务端文件永远停在之前某个版本**
+- **根因**：Shopify CLI 3.94.3 维护一个本地 checksum cache。某种污染状态下，cache 里的 checksum 错误地等于 server 上的某个旧 checksum，CLI 的 diff 算法认为"本地跟 server 一致 → 不需要上传"。改了文件内容 → 本地实际 checksum 变了，但 cache 没刷新（具体污染触发条件不清楚，跟之前 `could not be deleted` 状态相关）
+- **修法**（按激进程度排序）：
+  1. **重命名文件** —— `mv assets/foo.css assets/foo2.css` + 改 theme.liquid 引用 → CLI 必须把新文件名当新增上传。**几乎 100% 有效**
+  2. **删本地 + push（不带 --nodelete）让 CLI 同步 delete，再放回 + push** —— 强制 reset checksum
+  3. **在 admin 的 Edit Code UI 里编辑一次保存** —— 服务端 checksum 改变，CLI 下次 push 会重新比对
+- **教训**：
+  1. 判断 push 是否真生效的**唯一可靠指标是 `Uploading [XX%]` 进度条**。没看到进度条就一定是 silent skip
+  2. CLI 报告"Theme upload complete"完全没有真实意义（这个字符串在 silent-skip 路径上也会输出）
+  3. 改文件内容（包括加 `!important`、加注释、改版本号）**不一定**能让 CLI 重新上传。要靠**改文件名 / 改路径**才能 100% 突破
+  4. 这条踩在 floema-v1 collections-cta clip-path 修复时——连推 5 次都没生效，最后靠 rename 突破
+
+## P3-08：嵌套 wrapper `<div class="floema-page">` 在 Lumia/GemPages 母版上不可靠
+
+- **症状**：在 layout/theme.liquid 里写 `{% if request.page_type == 'index' %}<div class="page-wrapper floema-page">{% endif %}` 包裹 sections，inline banner 验证显示同一请求里 `request.page_type` 在头部判定为 'index'（body class 也加上了 `floema-index`），但 **wrapper 那行 `if` 输出的 div **居然没出现在 DOM 里**，DOM 用 inspector 看不到 `.floema-page` class 元素
+- **根因**：Lumia/GemPages 母版的 `<div class="page-content">` 容器和 `{% if request.design_mode %}{% section 'megamenu' %}{% endif %}` 之类的 Liquid 块会注入大量预渲染 HTML，**其中某个 section 输出了未闭合 `<div>` 或破坏性嵌套**，导致后面 Liquid 模板从字符串拼接角度看是对的、但实际写入 HTML 文档时被解析器吞掉
+- **修法**：**不要写嵌套子 wrapper**，直接把 `floema-page` class **合并到永远存在的 `<div class="page-content">` 上**：
+  ```liquid
+  <div class="page-content{% if request.page_type == 'index' %} floema-page page-wrapper{% endif %}" id="pageContent" role="main">
+    {{ content_for_layout }}
+  </div>
+  ```
+  这样：(a) wrapper 不依赖嵌套 if 块输出；(b) `page-content` 是母版根容器，永远在 DOM 里；(c) 一次性给同一节点加 floema-page 作用域
+- **教训**：
+  1. **Lumia/GemPages 派生主题里写嵌套 wrapper 是脆弱的**——母版 Liquid 注入的 HTML 不可控
+  2. 共享 wrapper 时**复用现有母版 div 加 class**（merge）比新开 wrapper div（nest）稳得多
+  3. 验证 wrapper 是否真的渲染：用 inline `<style> .your-wrapper::before { content: "marker" ... }</style>` 加在 head，刷新 preview 看 marker 是否出现 — marker 不出现就是 wrapper 不在 DOM
+
+## P3-16：导航 / overlay sections 在 Shopify wrapper 里占了 layout 空间 → footer 下方一大块空白
+
+- **症状**：Floema 14 个 sections 里 10-14 是 modal/drawer/grid/loading/curtain overlay（源站全是 `position:fixed` 浮层）。我把内部元素 `display:none` 之后 footer 下方仍多出大约 5 个 section 高的空白
+- **根因**：Shopify 渲染每个 section 时外面包一个 `<div class="shopify-section--XX">` block-level wrapper，inner element 隐藏不影响 wrapper 本身。Lumia 母版给所有 section wrapper 加了 `min-height` / `padding` reset，每个 section 即使内容空白也至少占 100px+
+- **修法**：直接在 wrapper 上 `display:contents !important`，让 wrapper 在布局中消失但子元素仍渲染（fixed overlay 仍工作）：
+  ```css
+  body.floema-index .shopify-section--floema-10-option-modal,
+  body.floema-index .shopify-section--floema-11-contact-modal,
+  ...
+  { display: contents !important; }
+  ```
+- **教训**：
+  1. **Shopify section wrapper 是 layout-affecting element**，永远要考虑它占多少 padding/margin/min-height
+  2. 移植任何 modal/drawer/curtain 类 overlay section 时，**默认就给 wrapper 加 `display:contents`**
+  3. 检查办法：DevTools Elements 里 hover 每个 `shopify-section--*` 看高亮蓝边的高度
+
+---
+
+## P3-15：自制 smooth-scroll 不同步 scrollbar drag → 拖一下 scrollbar 又跳回去
+
+- **症状**：Floema 用 GSAP ScrollTrigger 配自制 lerp wheel handler，拖右侧 scrollbar 到新位置释放后页面瞬间滑回原点
+- **根因**：自制 handler 维护内部 `target` + `current` 状态，只 hook `wheel` event。scrollbar 拖动直接改 `window.scrollY` 不走 wheel，下一次 wheel 计算 `target = oldTarget + delta`（旧 target 是被拖前的位置）→ 计算出来的目标位置回到旧位
+- **修法**：rAF tick 里检查 `window.scrollY` vs `lastAppliedY`（我们 scrollTo 设的最后值），不一致就 resync `target=current=sy`：
+  ```js
+  if (Math.abs(sy - lastAppliedY) > 2) { target = sy; current = sy; lastAppliedY = sy; }
+  ```
+  wheel handler 计算时也用真实 `window.scrollY` 当 base 而不是 stale target
+- **教训**：
+  1. **自制 smooth-scroll 必须考虑所有 scroll 来源**：wheel / scrollbar drag / anchor jump / ScrollTrigger.scrollTo / DevTools / 键盘 PageUp/Down
+  2. 维护 `lastAppliedY` 哨兵，每次 tick 比一遍 → 简单粗暴但能处理所有外部 scroll
+  3. Lenis/Locomotive 都内置这个 resync，自制时容易漏
+
+---
+
+## P3-14：Vue lazy-imported component 把真实动画机制藏在另一个 chunk
+
+- **症状**：Floema intro section liquid 里只看到 `<div class="floating-images"><span></span></div>` 空壳 + source CSS 写着 `.slider-image { animation: orbit 60s linear infinite; offset-path: ellipse(...) }`。按 CSS 复刻了 3 版（v1/v2/v3）都被用户说不对
+- **根因**：Vue 主组件用了 `const r = defineAsyncComponent(() => import('./C4rlixGp.js'))` lazy-load 一个子组件，主 chunk 里看不到子组件 setup。`C4rlixGp.js` 才是真正创建 `<canvas>` + `new Worker(new URL('Images.worker-XXX.js', ...))`，Three.js scene 在 worker 里跑。CSS 里的 `.slider-image { animation: orbit }` 是组件未挂载时的 fallback 死代码
+- **修法**：
+  1. 在主 JS chunk 里 grep 所有 `me\(\(\)=>import\("([^"]+)"\)` 把 lazy import 路径列出来
+  2. 对每个 chunk 看是否包含 `<canvas>`/`new Worker`/Three.js 关键词，确认是 3D scene 而不是普通组件
+  3. Worker 文件**末尾 ~100 行**才是用户场景代码（开头 4000+ 行是 Three.js 库 bundle），`tail -c 8000` 提取
+- **教训**：
+  1. **看到 `__vite__mapDeps([...])` 或 `defineAsyncComponent` → 必须追那个 chunk**
+  2. **Vue SFC 编译会把组件 scoped styles 全塞 `<head>` 里，组件本身没挂载时这些 CSS 就是死代码**。看到 `data-v-XXXXX` scope 的 CSS 选择器一定要去 inspect DOM 验证元素是否真的存在
+  3. **`new Worker(new URL(...))` 是 3D 场景的高频架构**，移植到 Lumia 上简化成主线程 Three.js 即可（worker 主要省主线程性能，主线程也能跑）
+
+---
+
+## P3-13：3D scene 用 packed RGBA 纹理 + shader 采样，不是粒子系统
+
+- **症状**：Floema collections-overview 的 `.shadows` div 第一眼以为是粒子叶子在飘，写了 60 片 ShapeGeometry 墨绿叶子 + 鼠标视差，用户截图原版后说"是软的圆形云朵不是锋利叶子"
+- **根因**：源站用了 **packed_texture_3.png**（一张 PNG，4 个通道分别打包 4 种植物轮廓 silhouette）+ **noiseTexture.png** + 自定义 GLSL shader。Fragment shader 按 `uLayer` uniform 采样不同通道：
+  ```glsl
+  float tex = texture2D(uTexture, uv).r;           // layer 0
+  if (uLayer == 1.0) tex = texture2D(uTexture, uv).g; // layer 1 — collections
+  if (uLayer == 3.0) tex = 1.0 - texture2D(uTexture, uv).w; // layer 3 — madeToLast
+  ```
+  然后用 noiseTexture 扰动 alpha 制造软边、用 smoothstep mask 做圆形 vignette
+- **修法**：
+  1. PowerShell 下载 `/3d/shadows/packed_texture_3.png` + `noiseTexture.png`，上传成 Shopify assets
+  2. ShaderMaterial 把源 vertex + fragment shader 整段抄过来（不要重写）
+  3. 按 section 配置 uniforms：collections layer 1 / rotation π·1.9 / offset(-0.15,-0.15) / alpha 0.9 / cover:true
+- **教训**：
+  1. **看到 `texture2D(uTexture, uv).g` 这种通道采样 → 一定有预制的 packed texture**，找 `/3d/` `/assets/` `/textures/` 目录看有没有
+  2. 用户描述「软」「云」「模糊」「不锋利」→ 必定是 shader-based effect 而不是粒子，重写思路：抄 shader + 抄纹理
+  3. shader uniform 配置（rotation/offset/alpha/layer）按 section 不同，必须读源码 `defaults map` 里的 per-type 配置全抄
+
+---
+
+## P3-12：Liquid → JS 的 asset URL 桥接需要 `<script type="application/json">`
+
+- **症状**：JS 需要拿到 41 张本地化图片的 Shopify CDN URL（绕 Sanity CORS），但 `asset_url` filter 只能在 .liquid 里渲染
+- **根因**：JS 文件是静态 asset，不经 Liquid 渲染；硬编码 `cdn.shopify.com/s/files/1/{shop_id}/...` 路径会在主题切换时断
+- **修法**：section liquid 里塞一个 JSON script tag，用 Liquid for 循环渲染：
+  ```liquid
+  <script type="application/json" id="floema-intro-image-urls">[
+  {%- for f in img_array -%}
+    "{{ f | asset_url }}"{%- unless forloop.last -%},{%- endunless -%}
+  {%- endfor -%}
+  ]</script>
+  ```
+  JS 端 `JSON.parse(document.getElementById('floema-intro-image-urls').textContent)` 读取。也可以用 `window.__floemaAssetUrls = {...}` 全局对象（少量 URL 时更简洁）
+- **教训**：
+  1. **Shopify CDN 路径包含 store ID，主题切换会变，永远不要在 JS 里硬编码**
+  2. JSON script tag 是最稳的 Liquid→JS 数据桥，比 data-attribute 更适合大数组
+  3. theme.liquid 里 `window.__namespace = { foo: "{{ ... }}", bar: "{{ ... }}" }` 比每个 section 都塞 JSON tag 更适合全局共享
+
+---
+
+## P3-11：跨域 CDN 图片 Three.js 加载失败 → 必须本地化为 Shopify asset
+
+- **症状**：Floema intro tunnel 用源站同款 Sanity CDN URL（`cdn.sanity.io/images/535lnz3g/.../*.png`）作为 Three.js TextureLoader 输入，41 张图全部加载失败，场景只剩彩色 placeholder 方块在飞
+- **根因**：Sanity CDN 对自家 hosted 域名（如 `www.floema.com`）发 CORS 头，但对 `himaxlimited.myshopify.com` 这种第三方域名要么不发 `Access-Control-Allow-Origin: *` 要么发了但 referer 校验失败。WebGL 上传纹理必须 CORS-clean 才能用，普通 `<img>` 标签可以容忍 tainted texture，但 Three.js 不行
+- **修法**：
+  1. PowerShell 写下载脚本 `Invoke-WebRequest` 批量拉源站 CDN 图到本地 `assets/` 目录
+  2. Liquid section 里用 `{%- for f in img_array -%}"{{ f | asset_url }}"{%- endfor -%}` 渲染 JSON 数组到 `<script type="application/json" id="..."`
+  3. JS 端 `JSON.parse(document.getElementById('...').textContent)` 拿到同源 Shopify CDN URL，TextureLoader 加载零阻力
+- **教训**：
+  1. **任何 3rd-party CDN 图片 + Three.js / WebGL canvas 一律要本地化**，不要奢望 CORS 头会自动通过
+  2. 排查时先写 placeholder material（彩色方块）让 scene 永远有内容 —— 看到方块飞起来 = Three.js 工程对，CORS 才是问题
+  3. Liquid `asset_url` 只能在 .liquid 文件里用，所以「JS 读 Liquid 计算的 URL」的桥梁就是塞一个 `<script type="application/json">` 标签
+  4. 别在 JS 里硬编码 Shopify CDN 路径（`cdn.shopify.com/s/files/1/.../assets/xx.png`）——主题 ID 切换时会断
+  5. Playbook 已加 §6.5「Three.js 外站资源必须先本地化」清单项（[03-animations.md](03-animations.md)）
+
+---
+
+## P3-10：CSS hint 与真实动画机制完全不符 — Vue SFC CSS 可能是死代码
+
+- **症状**：Floema intro section 的 source CSS 里有 `.slider-image { animation: orbit 60s linear infinite; offset-path: ellipse(...); }` 看起来像绕椭圆旋转的特效。按这个写了 v1/v2/v3 三版 JS（注入 `<img class="slider-image">` + animation-delay 错峰），用户三次都说"不对"。最后用户截图原版是 **dense ring of images** 浮现 + 飞过
+- **根因**：CSS 是 **死代码**（fallback 或老版本残留）。真实机制在 lazy-loaded Vue 子组件 `C4rlixGp.js` 里——它创建 `<canvas>` + Web Worker (`Images.worker-BWdQtf8a.js`)，用 Three.js 渲染 **3D Z-tunnel of textured planes**（46 个平面沿 Z 轴飞向相机，fibonacci 螺旋分布在半径 10 的环上）。CSS 里的 `.slider-image` 选择器在真实 DOM 中根本不存在
+- **修法**：
+  1. 删掉 v1/v2/v3 的 CSS orbit 实现
+  2. 读源码 worker 文件尾部（前面 4000+ 行是 Three.js 库代码，最后 ~100 行才是用户场景）找到 `bn` constants 和 setup callback
+  3. 把 Three.js scene 整套 port 过来：fibonacci lane、Z spawn、SPEED_START→SPEED_IDLE 衰减、scroll feedback、fog
+- **教训**：
+  1. **不要只看 source CSS 推 animation 机制**。Vue/Nuxt SFC 编译会把组件 scoped styles 全部塞 head，但 **JS 里的 dynamic `<canvas>` rendering 不会经过 CSS**
+  2. 看到 `data-component=intro` + `floating-images` 这种容器后，先 grep 同名 JS 文件（`grep -lE 'floating-images|intro' _nuxt/*.js`）确认是 CSS-only 还是 JS-driven
+  3. Vue lazy-import (`defineAsyncComponent` / `() => import('./X.js')`) 经常把重型 3D scene 藏在独立 chunk 里。看到 `__vite__mapDeps` 或 `() => me(() => import(...))` 就要追那个文件
+  4. Web Worker (`new Worker(new URL(...))`) 是高性能 3D scene 的常见模式 — Lumia/Dawn 上 port 时简化成主线程 Three.js 即可
+  5. 任何怀疑都先看 `_payload.json` + `_nuxt/*.js`，不要凭 CSS 猜机制
+
+---
+
+## P3-09：动态注入数据偷工减料 → 用户立刻发现（41 张 → 写了 16 张）
+
+- **症状**：源站 intro section 用 41 张 product PNG 沿椭圆轨道环绕标题（Vue 运行时注入），我自作主张「精选 16 张」节省 token，用户截图后说"我要的是完全与原站一致 不要有偷工减料的步骤"
+- **根因**：源站 Vue 运行时数据（图片/卡片/列表/任何 `v-for` 渲染的集合）扁平化时容易被当成"装饰性的多"，让人想"少几个看着也差不多"。但用户看的是 **数量是否对得上原版**，不是看着是否 OK。少了立刻露馅
+- **修法**：
+  1. 任何从 source `_payload.json` / `__NUXT_DATA__` 提取的数据集合（图片数组、collection list、product list、leaf count、wireframe count），**必须穷举不抽样**
+  2. 提取时把 grep 结果的行数对一遍 source 静态 HTML / payload 里声明的数量
+  3. 复刻 Three.js / Canvas 这种"看起来连续"的视觉效果时也一样——源站若声明 50 leaves，写 50 不写 30
+- **教训**：
+  1. **1:1 复刻 = 数量、顺序、字段都要对得上**。不要在数据量级上 "judgment call"，那是 source decisions、不是我的优化空间
+  2. 数据节流只在 _bundle size_ 实际成为问题（>1MB CDN cost）时才做，且要写明跟原版的差异
+  3. 任何 `const FOO_COUNT = N` 常量在文件头部加注释 `// source: 41 (verified from _payload.json intro array)`，让 review 时一眼能对账
+
+---
+
+## P3-08：Vue3 SFC scoped styles 漏抽 → 视觉骨架全丢
+
+- **症状**：把 Nuxt SSG 站的 5 个外部 CSS（entry / ArticleCard / RevealImage / Footer / LowerTagline）扁平化后部署，页面看起来全无样式——文字是无衬线默认字体，没有任何 layout、颜色、间距
+- **根因**：Vue3 SFC 编译时每个组件的 `<style scoped>` 会变成 inline `<style>` 块挂在 `<head>` 里（不打包到外部 CSS），靠 `data-v-XXXXXX` attribute selector 跟组件 DOM 匹配。Floema 站 head 里有 **68** 个这样的 inline style block，加起来 ~255KB。如果只扁平化外部 CSS，组件级样式全部丢失
+- **修法**：写 `extract-{name}-inline-styles.mjs`，遍历 head 里所有 `<style>` 块的 innerText 合并成单个 `{prefix}-inline-styles.css`，加入 theme.liquid 的 CSS 加载列表（顺序：inline-styles 在最前 → 外部 5 个 CSS → base.css）。还要扫 inline-styles 里的 `url()` 引用一起重写（Floema 案例里有 @font-face 引用字体）
+- **教训**：
+  1. **Nuxt SSG 站 ≠ 全部 CSS 在外部文件**。Vue3 SFC 模式默认把 scoped styles 内联到 head。如果只跟着 `<link rel="stylesheet">` 抓 CSS，会漏 60-80%
+  2. 立项第一件事除了 grep 外部 CSS，还要 grep `<style>` block 数量。`[regex]::Matches($html, '<style[^>]*>') | Measure-Object` 一行搞定
+  3. inline-styles 也可能含 url() 引用（@font-face、background-image），扁平化 url 重写不能漏
+
+---
+
 ## 模板
 
 新增 bug 时复制下面这段：

@@ -2,6 +2,43 @@
 
 每完成一个 section / 交互后，**按顺序走完下面 7 步**才算 done。漏一步几乎必有回归。
 
+## 0. 数据量对账（每个 section 起步先核）
+
+> 该步在 §1 视觉验收前先做。少了再多视觉调优都救不回来。详见 [BUGS.md P3-09](BUGS.md#p3-09)
+
+- [ ] **图片/卡片/列表数量**：source `_payload.json` 或静态 HTML 里数一次，写到代码里之前在 JS 文件头部注释 `// source: N (verified from ...)`
+- [ ] **粒子/leaf/小球数量**：源站 Three.js / Canvas 声明多少就写多少，**不要因为"看着差不多"砍数量**
+- [ ] **集合的顺序、字段、ID**：跟 payload 一致，不要重排
+- [ ] 1:1 复刻意味着 **数量 + 顺序 + 字段** 三件都对得上，少一件就被用户当成"偷工减料"
+
+## 0b. 动画机制溯源（先证伪 CSS-only 推测）
+
+> 详见 [BUGS.md P3-10](BUGS.md#p3-10) / [P3-14](BUGS.md#p3-14) — Floema intro 上面踩过坑，按 CSS 写了三版都不对
+
+- [ ] **看到 container element 后先 grep JS**：`grep -lE 'COMPONENT_NAME|CONTAINER_CLASS' _nuxt/*.js`，看是不是 JS-driven
+- [ ] **看到 lazy import**（`__vite__mapDeps` / `() => me(() => import(...))`） → 必须追那个独立 chunk 文件
+- [ ] **看到 `new Worker(new URL(...))`** → port 时把 worker 改成主线程 Three.js
+- [ ] **CSS 里 `@keyframes` + offset-path/animation 可能是死代码**（Vue SFC 组件移除后样式残留）。需要在真实 DOM 里 inspect 验证选择器是否命中
+- [ ] **3D 场景 / canvas / WebGL** 一般用 BüroGL/TresJS-like API，scene 逻辑在 worker 文件**末尾 ~100 行**的 `gC` / `xC` callback 里，前面 4000+ 行是 Three.js 库 bundle，必用 `tail -c 8000` 提取
+- [ ] **看到 `texture2D(uTexture, uv).g/b/a` 通道采样** → 一定有预制的 packed RGBA texture，找 `/3d/` `/assets/textures/` 目录下载，shader 不能用粒子近似（[P3-13](BUGS.md#p3-13)）
+
+## 0c. 资源同源化（Three.js 前置）
+
+> 详见 [BUGS.md P3-11](BUGS.md#p3-11) / [P3-12](BUGS.md#p3-12) — Sanity CDN 给 Three.js 永远 CORS 失败
+
+- [ ] **任何 Three.js / WebGL 用到的图片**：PowerShell 批量下载到本地 `assets/`，禁止直接引用源站 CDN
+- [ ] **3D scene 的纹理文件**（packed texture, noise, env map）：去源站 `/3d/` `/textures/` 路径直接拉
+- [ ] **JS 用到的 asset URL** 通过 `<script type="application/json">` 或 `window.__namespace = { url: "{{ ... | asset_url }}" }` Liquid 渲染传递，**禁止硬编码 cdn.shopify.com 路径**
+- [ ] **写完先建 placeholder material**（彩色方块）作 fallback，方便区分「场景坏」vs「CORS 错」
+
+## 0d. Section wrapper 占位检查
+
+> 详见 [BUGS.md P3-16](BUGS.md#p3-16)
+
+- [ ] **每个 modal/drawer/curtain/overlay section** 在 `.shopify-section--XX` wrapper 上加 `display:contents !important`
+- [ ] DevTools Elements hover 每个 `shopify-section--*` 看高亮蓝边的高度，<10px 才算正常
+- [ ] 滚到底部看 footer 下方有没有空白，有空白往上回滚找哪个 section wrapper 占了空间
+
 ## 1. 静态首屏（F5 后初始态）
 
 - [ ] 颜色对：文字 / 背景 / 边框，特别是 dark section 里的文字（容易被 Dawn 灰色 cascade 污染，参见 [02-css-cascade.md §1](02-css-cascade.md)）
