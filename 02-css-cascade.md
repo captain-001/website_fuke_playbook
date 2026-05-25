@@ -1,12 +1,16 @@
 # 02 — CSS Cascade 与 Dawn 干扰
 
+> ⚠️ **如果源站用 Tailwind v4**：先读 [BUGS.md P4-01](BUGS.md#p4-01) 跟 [08-nextjs-porting.md §3](08-nextjs-porting.md#3-tailwind-v4-layer-cascade-必须-unwrap) —— `@layer utilities` 必须 unwrap，否则 ALL Tailwind utility 输给 unlayered Lumia 规则，与 specificity 无关。
+> 
+> ⚠️ **自家防御层 self-sabotage 风险**：见 [BUGS.md P4-02 / P4-03 / P4-04](BUGS.md#p4-02) 跟 [08-nextjs-porting.md §9](08-nextjs-porting.md#9-反向-cascade-self-sabotage-检查清单)。不要给 inheritable property 在 body/wrapper 加 `!important`；不要套 `.{prefix}-page` 前缀给 h*/p 等通用元素加规则。
+
 ## 0. 核心原则
 
 Dawn 主题在 `assets/base.css` 里塞了几百条全局规则。**任何无前缀的 class 都可能被它污染**。规范：
 
 1. **所有自创 class 一律加 `fg-` 前缀**
 2. **section 内规则一律用嵌套选择器**（`.fg-banner-showroom .heading`，不是 `.heading`）
-3. **不确定时打开 DevTools → Computed 看实际生效值**
+3. **不确定时打开 DevTools → Computed 看实际生效值**（或用 [09-playwright-verify.md §5](09-playwright-verify.md#5-cdp-用-cssgetmatchedstylesfornode-找赢的规则) 的 CDP probe）
 
 ## 1. body 背景必须 !important
 

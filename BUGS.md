@@ -550,12 +550,155 @@
 
 ---
 
+---
+
+## P4-01：Tailwind v4 `@layer utilities` 全军覆没 in Lumia
+
+- **症状**：cravburgers 项目 hero h1 `.text-[30vw]` 编译后字号变 23px，`.text-red` 颜色变深灰，Lumia 母版的 `.h1-style, h1 { font-size: var(--heading-md-size) }`（spec 0,0,1）赢了 Tailwind 的 spec 0,1,0 utility class
+- **根因**：Tailwind v4 编译产物把所有 utility 包在 `@layer utilities { ... }` 里。CSS Cascade Layers 规范：**任何 unlayered 样式优先级永远高于 layered 样式，与 specificity 无关**。Lumia 的 unlayered h1 规则压倒所有 layered Tailwind utility
+- **修法**：写 brace-counter 脚本 `unwrap-{prefix}-layers.mjs` 剥离 `@layer NAME { ... }` 包装：
+  ```js
+  // 扫描 css，找 @layer NAME { ... } 闭合块，删 wrapper 保留 inner content
+  // 注意处理字符串字面量内的 {}
+  ```
+  剥离后 4 个 layer（properties / theme / base / utilities）全部 unlayered，Tailwind (0,1,0) 正常压过 Lumia h1 (0,0,1)
+- **教训**：
+  1. **接 Next.js 15 / Vite + Tailwind v4 项目第一件事**：`grep -oE '@layer [a-z]+' chunk.css` 看有没有 `@layer utilities`；有就必须 unwrap
+  2. CSS Cascade Layers 是 2022+ 规范，多数人不熟。Specificity 不再是终极裁判
+  3. 自己 grep `crav-app.css` 时，如果看到 `@layer` 关键字开头的大块包裹整个文件，就该警惕
+
+## P4-02：自家 `body.crav-index { color !important; font-family !important }` 反伤 Tailwind
+
+- **症状**：CTA h2 `text-red` 渲染成 #1b1b1b（我的 base.css 强制色），`heading300` 字体被覆盖
+- **根因**：我把 `color` 和 `font-family` 写在 `body.crav-index` 上加了 `!important`。这两个属性是 **inherited**，会传给所有子元素。Tailwind `.text-red { color: var(--red) }` (spec 0,1,0) 跟父级继承的 `!important` 在子元素的 cascade 上比较时，**父级继承值的 !important 强度会传递**——具体来说子元素若没有自己的 !important，inherited important 赢。
+- **修法**：删 base.css 里 body 上的 color/font-family `!important`。背景色 `!important` 是 OK 的（背景不继承）。
+- **教训**：
+  1. **不要给 inheritable properties 在父级加 `!important`**（color, font-family, font-size, line-height, letter-spacing, visibility, cursor, white-space …）。Tailwind utility 在子元素上没用 !important，全被父级继承压死
+  2. 唯一例外：背景色 / margin / padding / display 等 non-inherited 属性，加 `!important` 不会传染子元素
+
+## P4-03：自家 `.crav-page h1, .crav-page h2` 反伤 Tailwind leading
+
+- **症状**：CTA h2 `leading-[.75]` 行高变 25px（Lumia `.page-content` 的 15px/25px 默认值），导致 "feel the Change" 三行字挤一团
+- **根因**：我在 base.css 写了 `.crav-page h1, .crav-page h2 { line-height: inherit }`——本意是去掉 Lumia 的 1.4em，但 selector 是 `.crav-page h2` (spec 0,1,1) 高于 `.leading-\[\.75\]` (spec 0,1,0)。`inherit` 让 h2 从父级 `.page-content` 继承 25px line-height
+- **修法**：删掉 `.crav-page h1, h2 { line-height: inherit }` 规则；只保留 `margin: 0; font-weight: inherit` 等不冲突的重置
+- **教训**：
+  1. **写自家防御层 CSS 时，selector specificity 必须低于或等于 Tailwind utility**（最多 0,1,0），否则反伤
+  2. 不要套 `.{prefix}-page` 前缀给 h*/p/img 等通用元素加规则——会抬高 specificity 到 0,1,1
+  3. 想去掉 Lumia 的 h2 默认样式，应该针对 Lumia 的具体规则 `.h2-style` 用同样 specificity 覆盖，不是用 wrapper-prefix 提级
+
+## P4-04：Lumia `.page-content` 通过继承强加 font-size/line-height
+
+- **症状**：所有 page-content 子元素的 `font-size: 15px; line-height: 25px` 默认值，即使 Tailwind 写了 `text-[30vw]` 也会在没有 Tailwind 直接 match 的子元素上回落到 15/25
+- **根因**：Lumia 母版 `.modal-content, .page-content { font-size: var(--content-font-size, 15px); line-height: var(--content-line-height, 25px) }`。任何放在 `<div class="page-content">` 内的元素如果没有自己的 font-size/line-height 规则，就继承这两个值
+- **修法**：在 base.css 用 **更高 specificity** 中和：
+  ```css
+  .{prefix}-page.page-content {
+    font-size: inherit;
+    line-height: normal;
+  }
+  ```
+  `.{prefix}-page.page-content` (spec 0,2,0) > `.page-content` (spec 0,1,0)，胜出。值设为 `inherit` 让继承链回到 body/html 默认
+- **教训**：母版会用 `.page-content`、`.modal-content` 这种 wrapper-级 class 偷偷塞 inherited properties。每次新部署都要 probe wrapper 的 computed font-size/line-height 一遍
+
+## P4-05：Next.js `_next/image` 优化器输出 JPEG 丢 alpha
+
+- **症状**：cravburgers hero burgerH.webp / burgerwithhands.webp 显示黑色背景框，应该是 transparent。多张 webp 图片都有这问题
+- **根因**：抓取 WACZ 时 manifest 把 `/_next/image?url=...&w=N&q=75` 优化器的最大尺寸输出选为「flatten 后的原图」。但 Next.js 根据 Accept 协商，常常输出 `image/jpeg`（无 alpha），透明 PNG/WebP 被填黑底
+- **修法**：
+  1. **回到 raw 路径下载原图**：`https://{domain}/img/foo.png`、`https://{domain}/img-webp/foo.webp` 通常是 public/ 静态资源直出，保留 alpha
+  2. 检查 manifest 各文件 content-type，全是 `image/jpeg` 的 → 强制重下载 raw
+  3. 在浏览器开 raw URL 直接看能否看到棋盘格背景，确认透明
+- **教训**：
+  1. **`_next/image` 路径不是 source 原图，是 Next.js 优化器的协商输出**。透明素材必失真
+  2. flatten 脚本要把 raw `/img/` 和 `/img-webp/` 优先级**高于** `_next/image`，只在 raw 404 才退回
+  3. PowerShell Playwright `p.context().request.get(rawUrl)` 直接下载，绕过浏览器 Accept 协商
+
+## P4-06：Prettify HTML 让 char-split spans 之间出现 inline-block 空格
+
+- **症状**：footer CRAV 4 个 `<span data-pop>` 字母间出现 ~118px 空格，整段从源站 1265px 撑到 1620px，溢出 1440 viewport
+- **根因**：源站 minified HTML 4 个 span 紧贴无空白：`<span>C</span><span>R</span><span>A</span><span>V</span>`。我的 `extract-{name}-body.mjs` prettify 时给每个 span 单独一行，HTML parser 把换行+缩进当成 whitespace 文本节点。inline-block 元素之间的 whitespace 渲染为 **一个空格字符**，35vw=504px font-size 下 ~118px。4 个空格 = 472px 多余宽度
+- **修法**：在 section liquid 里把 char-split spans 拼回一行：
+  ```html
+  <span data-pop>C</span><span data-pop>R</span><span data-pop>A</span><span data-pop>V</span>
+  ```
+- **教训**：
+  1. **char-split (`split:"chars"`) 的 pop spans 不能跨行**。prettify 脚本里给这种结构特殊处理
+  2. word-split (`split:"words"`) 不受影响，因为 React 在 words 间显式渲染 `<span> </span>`
+  3. CSS 通用 fallback：`display: flex` 在 aria-hidden 父级——flex 容器忽略 whitespace text nodes，无副作用
+  4. **不要用 `font-size: 0` 父级 collapse 技巧**——它让 ScrollTrigger 的 `start: 'top 88%'` 测量 host 高度时回退到 0，pops 永远不揭示。教训见 P4-07
+
+## P4-07：`font-size: 0` 父级 collapse 技巧破坏 ScrollTrigger 测量
+
+- **症状**：在 aria-hidden 父级写 `font-size: 0` + 子 pop `font-size: 35vw` 来 collapse 字母间空白，结果 CRAV pops 永远卡在 `scale(0)` 不揭示
+- **根因**：ScrollTrigger 测量 trigger 元素的 `getBoundingClientRect()` 决定 `start: 'top 88%'` 何时触发。`font-size: 0` 让父级 layout box 高度变 0（即使子元素有 font-size:35vw，layout 计算是父级的），ScrollTrigger 认为 host 高度 0，触发位置错乱，`onEnter` 永不 fire
+- **修法**：放弃 CSS hack，回到 HTML 层面去掉 whitespace（见 P4-06 修法）
+- **教训**：
+  1. ScrollTrigger 测量 trigger 用的是父元素的 layout box，**不要给 trigger 元素或其祖先用 `font-size: 0`、`display: contents`、`visibility: hidden`** 这种破坏 layout 的招
+  2. CSS 收纳 whitespace 技巧虽多（`word-spacing: -1em`、`letter-spacing: -1em`、`font-size: 0`）但都有副作用，不如在 HTML 源头解决
+
+## P4-08：GSAP InertiaPlugin / MotionPathPlugin 是付费 plugin
+
+- **症状**：源码用 `inertia: {x: {velocity: 30*dx, end: 0}, ...}` 做 about-section media-item 鼠标跟随弹回，用 `motionPath: {path, autoRotate}` 做 map plane 沿 SVG 路径动画。直接复制会 console error: `Cannot read 'inertia' / 'motionPath' of undefined`
+- **根因**：GSAP 的免费版只含 Core + ScrollTrigger + SplitText (新) + CustomEase。InertiaPlugin 和 MotionPathPlugin 属于 Club GreenSock 付费 plugin
+- **修法**：
+  1. **InertiaPlugin → CSS transition 假装**：mousemove 时 translate(dx, dy)；mouseleave 时设 transition timing-function `cubic-bezier(.34,1.56,.64,1)` 弹回 base transform。少了 momentum 但视觉接近
+  2. **MotionPathPlugin → 用 `SVGGeometryElement.getPointAtLength`**：
+     ```js
+     const len = path.getTotalLength();
+     function setAt(progress) {
+       const p1 = path.getPointAtLength(progress * len);
+       const p2 = path.getPointAtLength(Math.min(len, progress * len + 1));
+       const angle = Math.atan2(p2.y - p1.y, p2.x - p1.x) * 180 / Math.PI - 90;
+       // scale SVG coords to container px
+       el.style.transform = `translate3d(${px}px, ${py}px, 0) translate(-50%, -50%) rotate(${angle}deg)`;
+     }
+     ScrollTrigger.create({ trigger, start, end, scrub: 1, onUpdate: (st) => setAt(st.progress) });
+     ```
+- **教训**：
+  1. 接收源码 GSAP 用法时先 grep `MotionPathPlugin`、`InertiaPlugin`、`DrawSVGPlugin`、`MorphSVGPlugin`、`SplitText` (老版) — 这些都是付费，必须找 vanilla 替代
+  2. 免费替代映射：MotionPath → `getPointAtLength`；Inertia → CSS transition；DrawSVG → `stroke-dasharray/dashoffset`；MorphSVG → `path.setAttribute('d', ...)` 配合自己写的 interpolator；老 SplitText → 自己 split words+chars 为 spans
+
+## P4-09：Cursor rope 静止时塌成一点的微妙时序
+
+- **症状**：实现 cursor rope（4 个 ingredient dots 跟随鼠标），鼠标停止时 4 个 dots 应该重叠到一点，但我的实现保持链式分散
+- **根因**：源码逻辑是「每次 mousemove **同时做两件事**」：
+  1. `gsap.to(segLen, {v: 8, duration: 0.01, overwrite: true})` —— 段间距瞬间复位 8
+  2. `setTimeout(() => gsap.to(segLen, {v: 0, duration: 0.5, ease: 'expo.out', overwrite: true}), 0)` —— 下个 tick 排「渐变到 0」
+  
+  持续移动时每帧都重置（mousemove 频率 > 500ms），段间距维持 8，链拉开。一旦停止，最后排好的「渐变到 0 over 500ms」完成，链段长度变 0 → 所有 dots 塌到同一点。
+  
+  我误以为塌缩是 mousedown 触发（甩鞭效果），写错了
+- **修法**：把塌缩逻辑挂在 mousemove 而非 mousedown，配合 `clearTimeout` 防累积
+- **教训**：
+  1. 源码看到 `setTimeout(..., 0)` 不要忽略——0ms timeout 是 race against next mousemove 的关键 idiom，让 cleanup 排到下个 tick
+  2. 复刻 cursor / scroll-driven 动画时**先列出所有 event handler 内做的事**，按时间轴排清楚，再翻译
+
+## P4-10：必须用 Playwright + CDP 自验，不要靠用户截图
+
+- **症状**：cravburgers 项目用户截图反馈 4 次明显错误（贴图黑框、字号、CRAV 重叠、动效缺失）才发现，被用户说"做完自己playwright确认位置 截图的都是明显不对的 修复完再自查"
+- **根因**：之前的部署后 verification 只是 push 成功就报告完成。preview URL 没自己开过浏览器看，明显的渲染错误就漏到了用户那里
+- **修法**：每次 push 后 mandatory 跑 Playwright probe + screenshot：
+  ```js
+  const cdp = await p.context().newCDPSession(p);
+  await cdp.send('DOM.enable'); await cdp.send('CSS.enable');
+  const found = await cdp.send('DOM.querySelector', { nodeId: docRoot, selector: '#hero h1' });
+  const styles = await cdp.send('CSS.getMatchedStylesForNode', { nodeId: found.nodeId });
+  // 看哪条规则赢、specificity、!important
+  ```
+  + 逐 section `el.scrollIntoView()` + `el.screenshot()` 让 ScrollTrigger 有机会触发
+- **教训**：
+  1. **不报告"部署完成"前必须 Playwright 自查**。看到明显不对就停下深挖，不要 push 给用户判断
+  2. CDP `CSS.getMatchedStylesForNode` 比 stylesheets API 强大（避开 CORS 限制，能拿到 inherited rules、specificity）
+  3. 完整 probe 模板见 [09-playwright-verify.md](09-playwright-verify.md)
+
+---
+
 ## 模板
 
 新增 bug 时复制下面这段：
 
 ```markdown
-## P2-XX：[一句话症状]
+## P4-XX：[一句话症状]
 
 - **症状**：...
 - **根因**：...

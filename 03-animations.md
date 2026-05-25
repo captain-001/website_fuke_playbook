@@ -1,13 +1,18 @@
 # 03 — 动画 / 交互
 
+> 复刻 GSAP 风格站点（特别是 Next.js + Tailwind v4）时，**先看** [08-nextjs-porting.md §8](08-nextjs-porting.md#8-source-动效完整-spec-速查crav-实战)。CRAV 项目沉淀了 8 类典型动效的完整 spec（pop 文字 / 贴纸 peel / jelly bar / 地图飞机 / cursor rope / 眼睛跟鼠标 / 杂耍球 / smooth scroll），从源 chunk 反推出来的参数（duration、ease、stagger、threshold、apex、spin 等）都能直接拿来用。
+> 
+> GSAP 付费 plugin（InertiaPlugin / MotionPathPlugin / DrawSVGPlugin / MorphSVGPlugin / 老 SplitText）的 **vanilla 替代** 见 [08-nextjs-porting.md §6](08-nextjs-porting.md#6-gsap-付费-plugin-vanilla-替代)。
+
 ## 1. 核心心法
 
 | 场景 | 用什么 |
 |---|---|
 | 一次性入场（hero heading 加载淡入） | CSS `@keyframes animation` |
 | 持续交互（hover、carousel 切换）需要可重放 | CSS `@keyframes animation` + remove/reflow/re-add 三件套 |
-| 滚动驱动（scrub 风格的视差 / 缩放 / 描边） | `--fg-progress: 0..1` CSS 变量 + `calc()` |
+| 滚动驱动（scrub 风格的视差 / 缩放 / 描边） | `--fg-progress: 0..1` CSS 变量 + `calc()`，或 GSAP ScrollTrigger scrub |
 | 状态平滑过渡（颜色、不透明度的 hover）| CSS `transition` |
+| 鼠标跟随 / 沿路径动画 | vanilla GSAP，详 [08-nextjs-porting.md §6 §8](08-nextjs-porting.md#6-gsap-付费-plugin-vanilla-替代) |
 
 ## 2. Transition vs Animation —— 选错就重放不了
 
