@@ -715,9 +715,125 @@
   3. **CDP 看 computed 跟本地 CSS 不一致**就是污染信号。不要找具体哪条规则注入（可能在 user-agent / inherited / 别的 sheet），直接 `!important` 封死最快
   4. **probe 输出的 height 28px 跟视觉漏出的几十像素 inner 内容看着不一致**——因为 inner 本身 818px、被 overflow:hidden 裁，padding 段的 28px 显示的是 inner 的 0-28px 区间，不是 800-828px。视觉上是 "inner 顶部那条" 漏出，不是底部
 
----
+## P4-12：CLI 多 `--only` 批量 push silent-skip 部分文件 — 必须逐文件 push + pull verify
 
-## 模板
+- **症状**：`shopify theme push --theme=X --only sections/A.liquid --only templates/B.json` 报 "pushed successfully" 但实际只有 B.json 落地，A.liquid 静默被跳过。预览页面渲染的还是老的 section ID（template 引用了一个不存在的 section type，但 Shopify 没报错而是 fallback 到默认）
+- **根因**：CLI silent-skip 已知坑（[P3-07c](#p3-07c)）的新触发条件 — 一次 push 命令里同时带多个 `--only` 时，部分文件被 CLI 内部去重/diff 算法误判为"无变化"跳过
+- **修法**：
+  ```bash
+  # ❌ 不要这样
+  shopify theme push --only "sections/A.liquid" --only "sections/B.liquid" --only "templates/C.json"
+  # ✓ 改成
+  shopify theme push --only "sections/A.liquid"
+  shopify theme pull --only "sections/A.liquid"   # verify
+  shopify theme push --only "sections/B.liquid"
+  shopify theme pull --only "sections/B.liquid"
+  shopify theme push --only "templates/C.json"
+  shopify theme pull --only "templates/C.json"
+  ```
+  push 后立刻 pull 同一路径验证 — 文件不存在 / 内容跟本地不一致就是 silent-skip 信号
+- **教训**：
+  1. **"pushed successfully" 是常量字符串**，不代表所有 `--only` 路径都真上传了
+  2. **多个文件一起推 = silent-skip 风险**，逐个推 + pull verify 是唯一可靠路径
+  3. 一次 push 4+ 文件时，至少 1 个被 skip 的概率 ≈ 50%
+
+## P4-13：image_picker → admin Files 走 Admin GraphQL API（stagedUploadsCreate + fileCreate）
+
+- **症状**：section schema 写 `{ "type": "image_picker", "id": "image" }` 后，admin 期望从 Files 库选图。collection.json 用 `"image": "shopify://shop_images/foo.jpg"` 引用 — 但这要求 `foo.jpg` 已经在 Files。Shopify CLI 不提供 Files 上传命令
+- **根因**：Files API 是 Admin GraphQL `stagedUploadsCreate` + `fileCreate` 两步 — 拿临时 GCS URL → POST multipart 上传 → 用 resourceUrl 注册到 Files
+- **修法**：参考 [`d:/shopify_try/upload-susos-files.mjs`](../upload-susos-files.mjs) Node 脚本。关键 flow：
+  ```
+  1. shopify store auth --store X --scopes write_files,read_files,read_products
+  2. stagedUploadsCreate mutation → 返回 { url, resourceUrl, parameters[] }
+  3. fetch(url, { method: POST, body: multipart with all parameters + file blob })
+  4. fileCreate mutation with originalSource=resourceUrl, contentType=IMAGE (or FILE for SVG)
+  ```
+  Windows CLI 坑（也写进来一并防范）：
+  - bin path 是 `shopify.cmd` 不是 `shopify`，Node `execFileSync` 加 `shell: process.platform === 'win32'`
+  - 多行 query 不能用 `--query "..."` (shell 拼接坏字符串)，改用 `--query-file <path>`
+  - 变量参数 flag 是 `--variable-file` **单数**（不是 `--variables-file`），写错就 "Nonexistent flag"
+  - 加 `--json --no-color` 让 CLI 输出纯 JSON 而不是带 banner
+  - `--json` 输出没有 GraphQL 标准 `data` 外层，直接 `response.fileCreate.files[0]` 访问
+- **教训**：
+  1. **image_picker 不强依赖 admin Files**。section liquid 写 `{%- if section.settings.image != blank -%}` 用图，`{%- else -%}` fallback 到 `'susos-orig-X.jpg' | asset_url` theme asset — 这样未上传 Files 时也能显示真实图，admin 后续可上传覆盖
+  2. **Press marquee / 产品 demo gallery 等"装饰性多图"用 theme asset 命名规则就够了**（`susos-orig-*` 前缀），不必走 Files API
+  3. **Admin Files 上传只针对"需要 admin 后期换图"的位置**：hero banner、designer 图、about 双图、cert 4 张等核心
+  4. SVG 资产用 `contentType: "FILE"` 不是 `"IMAGE"`，否则 fileCreate 报错
+
+## P4-14：自家 section bg 跟 body section wrapper class 单 class specificity 撞、bg 被刷回白
+
+- **症状**：collection 页面 demo-grid 想要浅灰底 `#F7F7F5`，section 写 `.susos-cdg { background: #F7F7F5 }`。但实际渲染 cdg 是白色 `#fff` — wrapper shopify-section 反而是灰
+- **根因**：demo-grid section 的 schema `class` 字段写了 `"susos-collection-body susos-cdg-wrapper"`（为了复用 body section 已有的 `.susos-collection-body .ucol-card` 等 CSS）。body section 自己也声明了 `.susos-collection-body { background: #fff }` 单 class 0,1,0。我的 `.susos-cdg { background: #F7F7F5 }` 也是 0,1,0 — Shopify OS 2.0 把所有 sections 的 `{% stylesheet %}` 打进一个共享 styles.css，body section 的规则在 compiled 文件里后出现就赢了
+- **修法**：
+  ```css
+  /* ❌ 单类 specificity 0,1,0 撞不过 */
+  .susos-cdg { background: #F7F7F5 }
+  /* ✓ 双类 0,2,0 + !important 双保险 */
+  .susos-cdg.susos-collection-body { background: #F7F7F5 !important; }
+  ```
+- **教训**：
+  1. **建新 section 前先 grep**：`grep "{class-name}" sections/*.liquid` 看是不是已经有同类规则
+  2. **复用既有 CSS 的 wrapper class 是双刃剑** — 拿到 inherited card / grid / facet styles，但也继承了 wrapper 自己的 bg / padding，要 proactively override
+  3. **Shopify OS 2.0 把所有 sections 的 `{% stylesheet %}` 全打进 compiled styles.css**（[P5-01 待加](BUGS.md)），单类规则的覆盖顺序无法预测，必须用 double-class 或 `!important` 锁死
+
+## P4-15：Mobile carousel 硬编码 padding ≠ wrapper `--pdp-pad-x` clamp 值，cards 跟 heading 不齐
+
+- **症状**：collection / related 卡片在 mobile 用 horizontal scroll-snap 轮播。第一卡 left=0 直接撞 viewport 边缘，但 heading 在 20px。整体歪
+- **根因**：自家 CSS 写了 `padding: 4px 28px 18px; margin: 0 -28px;` 硬编码 28px（之前抄 himax 的）。但 wrapper `.susos-pdp__wrap` / `.sx-container` 用 `padding: 0 clamp(20px, 4vw, 80px)` 动态值，mobile 是 20px，desktop 是 80px。28px 不对齐任何 viewport
+- **修法**：mobile carousel 不要 bleed-out（不要 negative margin），让 cards 自然继承 wrapper 的 padding：
+  ```css
+  /* ❌ bleed-out 硬编码 — cards 撞 viewport 边 */
+  .grid {
+    margin: 0 -28px;
+    padding: 4px 28px 18px;
+  }
+  /* ✓ 用 wrapper 同步 — 让 wrapper 自己的 padding 约束 grid */
+  .grid {
+    padding: 4px 0 18px;
+    margin: 0;
+  }
+  /* cards 自然从 wrapper.padding-left (20px on mobile) 开始 */
+  ```
+- **教训**：
+  1. **bleed-out（grid 拉到 viewport 边缘 + 内 re-pad）是反模式**。看似让"轮播末尾平滑溢出"，实际破坏 heading 与第一卡的对齐
+  2. **mobile carousel 正确做法**：cards 守在 wrapper.padding-x 内（首卡跟 heading 同列起），multi-card overflow 自然被 `overflow-x: auto` 滚动出去
+  3. 永远从 source 抽 wrapper 的 padding 值（用 CSS var 或 clamp），不要"看着差不多"塞硬编码
+
+## P4-16：Mobile 元素被困在隐藏抽屉里 → 全屏看不见
+
+- **症状**：susos-header 移动端缺搜索框（原版应在 logo 下常驻）。但 HTML 里 `<form class="sh-mobile-search">` 是有的，CSS `.sh-mobile-search { display: flex }` 也设了。看着应该显示
+- **根因**：`.sh-mobile-search` 嵌在 `<nav class="sh-row sh-row--nav">` 内。`.sh-row--nav` 在 `@media (max-width: 960px)` 下 `display: none`，只有 `.sh-is-open` 父类（burger 点开）才显示。子级 `display: flex` 在父级 `display: none` 下完全无效
+- **修法**：把 `.sh-mobile-search <form>` 从 `<nav class="sh-row sh-row--nav">` 内**移出**，放在 `.sh-row--top` 和 `.sh-row--nav` 之间：
+  ```html
+  <div class="sh-row sh-row--top">...logo + burger + tools...</div>
+
+  <form class="sh-mobile-search">...always visible on mobile, hidden on desktop via @media...</form>
+
+  <nav class="sh-row sh-row--nav">...nav links only, hidden by default on mobile until burger clicked...</nav>
+  ```
+- **教训**：
+  1. **`display: none` 父级 + 任何子级样式都没用**。grep 元素位置不只看 CSS，还要看 HTML 嵌套层级
+  2. **类似坑还会出现在**：modal trigger 在 modal 里、tooltip 在 hidden tab 里、mobile-only 搜索/CTA 嵌在 desktop 隐藏的导航内
+  3. mobile 元素全屏调试用 Playwright `390×844` viewport 模拟，肉眼可见就 OK，不可见就有结构问题
+
+## P4-17：Section liquid 生成短 slug class vs CSS 只定义长 slug — 全部 fallback 到默认
+
+- **症状**：PDP 变体色块 6 个 swatch 全部默认浅灰，没有任何 gradient。可视确认有 `.susos-swatch--{slug}` class 加上，但 CSS 里这些类完全无 background 规则
+- **根因**：section liquid 里 demo 分支生成 slug 是 `'pearl' / 'ivory' / 'stone' / 'matte' / 'gold' / 'bronze'`（来自 `demo_slugs` array）。CSS 里只定义 `.susos-swatch--pearl-white / --warm-ivory / --stone-grey / --matte-black / --champagne-gold / --brushed-bronze`（长名）。短长不匹配 → 全部 fall through 到 base `.susos-swatch { background: #F7F7F5 }`
+- **修法**：CSS selector 合并支持两套：
+  ```css
+  .susos-swatch--pearl-white,    .susos-swatch--pearl  { background: linear-gradient(135deg, #fafafa, #ededed); }
+  .susos-swatch--warm-ivory,     .susos-swatch--ivory  { background: linear-gradient(135deg, #f4ebd9, #d7c8aa); }
+  .susos-swatch--stone-grey,     .susos-swatch--stone  { background: linear-gradient(135deg, #cfcec9, #908f8a); }
+  .susos-swatch--matte-black,    .susos-swatch--matte  { background: linear-gradient(135deg, #2a2a2a, #111); }
+  .susos-swatch--champagne-gold, .susos-swatch--gold   { background: linear-gradient(135deg, #d8b574, #a8773c); }
+  .susos-swatch--brushed-bronze, .susos-swatch--bronze { background: linear-gradient(135deg, #b89070, #7a5538); }
+  ```
+- **教训**：
+  1. **liquid 生成的 class 类名必须跟 CSS selectors 字面匹配**。grep 你的 liquid 输出的 class，再 grep 你的 CSS 是否定义了该 selector
+  2. **`value | downcase | replace ' ', '-'` 的 slug 跟人脑想象的 slug 可能不一致**。"Stone Grey" → `stone-grey`，但 demo 数组可能写的是 `stone`。看 liquid 源码确认实际输出
+  3. **Playwright probe 时打印 element.className + computed style** 一起，前者看 class 实际名字，后者看 background 实际值，对不上就是 class/CSS 不匹配
+
 
 新增 bug 时复制下面这段：
 
