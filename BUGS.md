@@ -834,6 +834,26 @@
   2. **`value | downcase | replace ' ', '-'` 的 slug 跟人脑想象的 slug 可能不一致**。"Stone Grey" → `stone-grey`，但 demo 数组可能写的是 `stone`。看 liquid 源码确认实际输出
   3. **Playwright probe 时打印 element.className + computed style** 一起，前者看 class 实际名字，后者看 background 实际值，对不上就是 class/CSS 不匹配
 
+## P4-18：覆盖既有 default 模板 push 需要 `--allow-live`，否则 silent-skip 但报 success
+
+- **症状**：`shopify theme push --theme=X --only templates/collection.json` 报 "pushed successfully" 但 pull 验证 remote 内容完全没变。重试 + 改文件内容（加 `_v` field 造新 checksum）都没用 — pull 出来还是老版
+- **根因**：Shopify CLI 把"向已存在的 default 模板（`templates/product.json` / `collection.json` / `index.json` 等）写入"当成 live-theme 写操作，**non-interactive 环境**（被 Node `execSync` / `> file` / `| pipe` 调用，stdout 不是 TTY）下既不弹 prompt 也不上传，但 banner 仍然打印 success。新建文件（如 `templates/X.<suffix>.json`、`sections/*.liquid`、`assets/*`）不触发 live-theme 保护，正常上传
+- **修法**：
+  ```bash
+  # ❌ 推 default 模板时 silent-skip
+  shopify theme push --theme=X --only "templates/collection.json"
+  # ✓ 必须加 --allow-live
+  shopify theme push --theme=X --allow-live --only "templates/collection.json"
+  ```
+  即使目标 theme 本身是 unpublished 也要加 `--allow-live` —— CLI 只看"是否覆盖既有 default-named 模板"，不看 theme 是否真 live
+- **教训**：
+  1. **覆盖既有 default 模板必加 `--allow-live`**：product.json / collection.json / index.json / page.json / blog.json / article.json / cart.json / 404.json + layout/theme.liquid + config/settings_data.json 这类一律加
+  2. **CLI 的 "pushed successfully" 是常量字符串**，不代表所有 `--only` 路径都真上传了。逐文件 push + pull verify 是唯一可靠路径（[P4-12](#p4-12)）
+  3. **JSON 模板加自定义顶层 key 会被 schema 拒** — 想造新 checksum 骗 cache 的话不能加 `_v` 这类字段（Shopify 报 `unknown key '_v'`），只能改 `sections.X.settings.Y` 内部
+  4. 触发条件总结：default 模板覆盖 + non-interactive shell = silent-skip + 假 success
+- **历史**：这个跟 [P3-07c CLI bulk push 静默跳过部分新文件](#p3-07c) 不同 — 那个是 batch 多文件丢部分，这个是单文件 100% 跳过
+
+---
 
 新增 bug 时复制下面这段：
 
