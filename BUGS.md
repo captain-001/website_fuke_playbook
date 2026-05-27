@@ -691,6 +691,30 @@
   2. CDP `CSS.getMatchedStylesForNode` 比 stylesheets API 强大（避开 CORS 限制，能拿到 inherited rules、specificity）
   3. 完整 probe 模板见 [09-playwright-verify.md](09-playwright-verify.md)
 
+## P4-11：Lumia 母版给 accordion `__body` 偷偷塞 `padding-bottom: 28px`，collapsed 状态漏 inner 内容
+
+- **症状**：SUSOS PDP 规格 accordion（Certifications / Dimensions / Main Features / Smart Functions / Downloads）closed 状态下，每个 item 标题下方都漏出一条 inner content 的底部（比如 "Item code S-MLB-300D" 一行、Washing subhead、3 个 Downloads 卡片）。`is-open` toggle 本身是对的，被点开的能正确展开，被收起的 `.is-open` class 也被移除了
+- **根因**：自家 CSS 里 `.susos-acc__body { max-height: 0; overflow: hidden }` 看着没错，但 Lumia 母版（或某条 unscoped 全局规则）匹配上了 `.susos-acc__body` 并注入了 `padding: 0 0 28px`。`max-height: 0` 限制的是 **content box** 高度 = 0，但 padding 不在 max-height 控制范围内，让 padding box 撑出 28px。box-sizing 默认 content-box 时 padding 是额外加在外面的——inner 元素的 layout box（818px）大部分被 `overflow: hidden` 裁掉了，但 padding 段的 28px 露出了 inner 底部那条
+  - CDP 验证：closed `.susos-acc__body` computed `padding: 0px 0px 28px`，`height: 28px`，但本地 susos-pdp.css 完全没写这个 padding
+  - 没法稳定定位是哪条规则注入，因为 CDP `CSS.getMatchedStylesForNode` 过滤 padding 关键字时这条规则被归到了 "user-agent / inherited" 通道
+- **修法**：给自家 CSS 加一次性 `!important` 装甲，所有可能被污染的属性都封死：
+  ```css
+  .susos-acc__body {
+    max-height: 0 !important;
+    overflow: hidden !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    transition: max-height .35s ease !important;
+  }
+  .susos-acc__item.is-open .susos-acc__body { max-height: 3200px !important; }
+  ```
+  推完 CDP 验证 closed body `height: 0px`，`padding: 0px`，inner 完全裁掉
+- **教训**：
+  1. **`max-height: 0` 不等于 box-height: 0**。`padding` / `border` 都不受 max-height 控制，会让 box 仍然占据空间。母版只要塞一点 padding 就能让"折叠"假装失败，露出 inner 的底部
+  2. **Accordion / disclosure 类组件的 collapsed 状态防御**：max-height / overflow / padding / margin 四件套都要写，且至少 max-height 和 padding 加 `!important`。这是 Lumia/Dawn 派生母版上的 standing assumption
+  3. **CDP 看 computed 跟本地 CSS 不一致**就是污染信号。不要找具体哪条规则注入（可能在 user-agent / inherited / 别的 sheet），直接 `!important` 封死最快
+  4. **probe 输出的 height 28px 跟视觉漏出的几十像素 inner 内容看着不一致**——因为 inner 本身 818px、被 overflow:hidden 裁，padding 段的 28px 显示的是 inner 的 0-28px 区间，不是 800-828px。视觉上是 "inner 顶部那条" 漏出，不是底部
+
 ---
 
 ## 模板
